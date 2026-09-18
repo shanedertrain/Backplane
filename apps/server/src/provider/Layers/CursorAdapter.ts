@@ -1055,6 +1055,7 @@ export function makeCursorAdapter(
                     harness: "Cursor",
                     model: resolvedModel,
                     environment: options?.environment,
+                    cwd: ctx.session.cwd,
                   }),
                 },
               ],

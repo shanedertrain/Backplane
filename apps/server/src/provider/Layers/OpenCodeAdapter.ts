@@ -3221,6 +3221,7 @@ export function makeOpenCodeAdapter(
                   harness: "OpenCode",
                   model: `${parsedModel.providerID}/${parsedModel.modelID}`,
                   environment: options?.environment,
+                  cwd: context.session.cwd,
                 }),
                 parts: [...(text ? [{ type: "text" as const, text }] : []), ...fileParts],
               },

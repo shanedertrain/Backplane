@@ -1589,6 +1589,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 model: displayModel,
                 reasoningEffort: normalizeGrokReasoningEffort(requestedTurnReasoningEffort),
                 environment: options?.environment,
+                cwd: ctx.session.cwd,
               });
               for (let yieldAttempt = 0; yieldAttempt < 8; yieldAttempt += 1) {
                 yield* Effect.yieldNow;

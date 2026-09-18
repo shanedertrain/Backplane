@@ -1087,6 +1087,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                       harness: "Antigravity",
                       model,
                       environment: options.environment,
+                      cwd: context.cwd,
                     }),
                   },
                 ],
