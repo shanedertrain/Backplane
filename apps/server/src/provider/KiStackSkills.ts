@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -78,14 +79,63 @@ async function installBundledFiles(directory: string): Promise<void> {
   }
 }
 
-function instructions(metadata: Metadata, directory: string): string {
+/**
+ * Project-local skills that shadow a same-named bundled KiStack skill.
+ *
+ * Root cause this exists to fix: `buildRuntimeInstructions` unconditionally
+ * injected Backplane's own bundled/cached KiStack snapshot into every agent's
+ * runtime context, with no awareness of the workspace at all -- a project
+ * pinning its own fork of a same-named skill (e.g. via a git submodule
+ * symlinked into `.claude/skills/<name>`) had its content silently shadowed
+ * by Backplane's generic copy, even though the provider's own native project
+ * skill loading (Claude Code's `settingSources: ["project"]`, for example)
+ * would otherwise have surfaced the project's real file. This is a
+ * name-existence check only -- content and scope semantics remain each
+ * provider's own responsibility; this just stops Backplane's bundled block
+ * from re-asserting a name the project has already claimed.
+ *
+ * Providers are expected to keep loading `.claude/skills/<name>` (or their
+ * own equivalent project-skill location) themselves; this function only
+ * decides which names Backplane's own injected block should stay silent
+ * about.
+ */
+function findProjectOverriddenSkillNames(
+  cwd: string,
+  candidateNames: ReadonlyArray<string>,
+): ReadonlySet<string> {
+  const overridden = new Set<string>();
+  for (const name of candidateNames) {
+    if (!safePath(name)) continue;
+    const skillFile = NodePath.join(cwd, ".claude", "skills", name, "SKILL.md");
+    // Existence only, deliberately synchronous: this feeds a system-prompt
+    // string built at the top of a request, not worth threading async
+    // through six otherwise-synchronous provider adapters for.
+    if (NodeFS.existsSync(skillFile)) overridden.add(name);
+  }
+  return overridden;
+}
+
+function instructions(
+  metadata: Metadata,
+  directory: string,
+  overriddenNames: ReadonlySet<string> = new Set(),
+): string {
+  const effectiveSkills = metadata.skills.filter((skill) => !overriddenNames.has(skill.name));
+  const provenanceLine =
+    overriddenNames.size > 0
+      ? [
+          `The project has its own pinned copy of: ${[...overriddenNames].sort().join(", ")}. ` +
+            "Use the project's .claude/skills/<name>/SKILL.md for those instead of anything described here.",
+        ]
+      : [];
   return [
     "<kistack_skills>",
     "Before doing any work related to any skill listed below, you MUST read that skill's complete SKILL.md and follow its instructions and workflow. Apply every relevant skill, even when the user does not explicitly name it. Do not skip a relevant skill because you already know how to do the task.",
     `<backplane_kicad_board_editing>${backplaneBoardEditingGuidance}</backplane_kicad_board_editing>`,
-    `Backplane includes KiStack by American Embedded (${source}, revision ${metadata.revision}). These skills are always available in every project.`,
+    `Backplane includes KiStack by American Embedded (${source}, revision ${metadata.revision}). These skills are always available in every project except where a project overrides one of the same name.`,
     "Resolve referenced scripts and documents relative to that skill's directory. User instructions take precedence. Other installed skills remain available.",
-    ...metadata.skills.map(
+    ...provenanceLine,
+    ...effectiveSkills.map(
       (skill) =>
         `- ${skill.name}: ${skill.description} Read ${JSON.stringify(NodePath.join(directory, skill.path))}`,
     ),
@@ -337,7 +387,16 @@ export function createKiStackSkills(options: {
     get skills() {
       return active.skills;
     },
-    buildInstructions: () => instructions(active, directory()),
+    buildInstructions: (cwd?: string) => {
+      const overridden =
+        cwd === undefined
+          ? new Set<string>()
+          : findProjectOverriddenSkillNames(
+              cwd,
+              active.skills.map((skill) => skill.name),
+            );
+      return instructions(active, directory(), overridden);
+    },
   };
 }
 
@@ -398,8 +457,17 @@ export function mergeKiStackProviderSkills(
   ];
 }
 
-export function buildKiStackInstructions(directory?: string): string {
+export function buildKiStackInstructions(directory?: string, cwd?: string): string {
   return directory === undefined
-    ? defaultSkills.buildInstructions()
-    : instructions(bundledMetadata, directory);
+    ? defaultSkills.buildInstructions(cwd)
+    : instructions(
+        bundledMetadata,
+        directory,
+        cwd === undefined
+          ? undefined
+          : findProjectOverriddenSkillNames(
+              cwd,
+              bundledMetadata.skills.map((skill) => skill.name),
+            ),
+      );
 }

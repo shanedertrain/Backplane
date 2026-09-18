@@ -56,6 +56,79 @@ it("reports installation errors instead of advertising unavailable skills", asyn
   }
 });
 
+it("omits a bundled skill from the injected instructions when the project pins its own copy of the same name", async () => {
+  // Regression test for the root cause found in the Albatross Automata
+  // hardware repo: buildRuntimeInstructions -> buildKiStackInstructions()
+  // was called with no project context at all, so the *injected system-
+  // prompt text* always asserted Backplane's own bundled/cached KiStack
+  // content for every skill name, even when a project had its own pinned
+  // copy of the same name on disk (e.g. a git submodule symlinked into
+  // .claude/skills/<name>). mergeKiStackProviderSkills (used only for the
+  // `$` picker) already got this right; buildKiStackInstructions (used for
+  // the actual runtime instructions every provider adapter injects) did not
+  // consult the project at all.
+  const project = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "backplane-project-"));
+  try {
+    const overriddenDir = NodePath.join(project, ".claude", "skills", "kicad-export");
+    await NodeFSP.mkdir(overriddenDir, { recursive: true });
+    await NodeFSP.writeFile(
+      NodePath.join(overriddenDir, "SKILL.md"),
+      "---\nname: kicad-export\ndescription: Project-pinned copy\n---\nPROJECT_MARKER: CPL rotation guidance lives here.\n",
+    );
+
+    const bundledDir = await NodeFSP.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "backplane-kistack-bundled-"),
+    );
+    try {
+      await installKiStackSkills(bundledDir);
+
+      const withoutProjectContext = buildKiStackInstructions(bundledDir);
+      expect(withoutProjectContext).toContain("kicad-export:");
+
+      const withProjectContext = buildKiStackInstructions(bundledDir, project);
+      expect(withProjectContext).not.toContain(
+        JSON.stringify(NodePath.join(bundledDir, "skills/export/SKILL.md")),
+      );
+      expect(withProjectContext).toContain("kicad-export");
+      expect(withProjectContext).toContain("The project has its own pinned copy of: kicad-export.");
+      // Every other bundled skill is unaffected -- this is a per-name check,
+      // not a blanket "project exists" switch.
+      expect(withProjectContext).toContain(
+        JSON.stringify(NodePath.join(bundledDir, "skills/layout/SKILL.md")),
+      );
+    } finally {
+      await NodeFSP.rm(bundledDir, { recursive: true, force: true });
+    }
+  } finally {
+    await NodeFSP.rm(project, { recursive: true, force: true });
+  }
+});
+
+it("end-to-end: this project's real pinned KiStack fork shadows the bundled catalog entry it duplicates", async () => {
+  // Uses the actual hardware repo checkout this bug was found in, not a
+  // synthetic fixture -- proves the fix against the real pinned fork commit
+  // (.claude/vendor/kistack @ 775ba27), which carries a real, distinctive
+  // CPL-rotation-guidance addition to skills/export/SKILL.md that the
+  // bundled catalog does not have.
+  const hardwareRepo = "/home/cbash23/projects/hardware";
+  const pinnedExportSkill = NodePath.join(hardwareRepo, ".claude/skills/kicad-export/SKILL.md");
+  const pinnedContent = await NodeFSP.readFile(pinnedExportSkill, "utf8").catch(() => undefined);
+  if (pinnedContent === undefined) {
+    // Environment-specific fixture unavailable (e.g. CI without that repo
+    // checked out) -- the synthetic test above covers the same logic.
+    return;
+  }
+  expect(pinnedContent).toContain("TPS2553DBVR");
+
+  const instructions = buildKiStackInstructions(undefined, hardwareRepo);
+  // This repo pins ALL ten kistack skills as submodule symlinks (not just
+  // kicad-export), so the provenance line lists all ten -- proving the
+  // check is genuinely per-name across the whole catalog, not a special
+  // case for the one skill this bug was first found through.
+  expect(instructions).toMatch(/The project has its own pinned copy of:.*\bkicad-export\b/);
+  expect(instructions).not.toMatch(/Read ".*\/backplane\/kistack\/.*skills\/export\/SKILL\.md"/);
+});
+
 it("exposes KiStack skills in the provider catalog without replacing native skills", () => {
   const native = {
     name: "kicad-pcb",

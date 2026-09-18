@@ -4628,6 +4628,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           append: buildRuntimeInstructions({
             harness: "Claude Code",
             environment: claudeEnvironment,
+            cwd: input.cwd,
           }),
         },
         settingSources: [...CLAUDE_SETTING_SOURCES],
