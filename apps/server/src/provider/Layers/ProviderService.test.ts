@@ -420,7 +420,7 @@ function makeProviderServiceLayer(
     readonly analyticsLayer?: Layer.Layer<AnalyticsService.AnalyticsService>;
     readonly registry?: ProviderAdapterRegistry.ProviderAdapterRegistry["Service"];
     readonly refreshKiStackSkills?: () => Promise<void>;
-    readonly getKiStackInstructionsSnapshot?: () => {
+    readonly getKiStackInstructionsSnapshot?: (cwd?: string) => {
       readonly revision: string;
       readonly instructions: string;
     };
@@ -669,6 +669,44 @@ kistackInstructionsFixture.layer("KiStack instruction updates", (it) => {
       assert.equal(inputs[0], "first\n\n<kistack-v1>");
       assert.equal(inputs[1], "second");
       assert.equal(inputs[2], "third\n\n<kistack-v2>");
+    }),
+  );
+});
+
+// Regression test for the second half of the kicad-agent-phase2 skill-
+// precedence root cause: sendTurn's own getKiStackInstructionsSnapshot()
+// call (separate from RuntimeInstructions.ts's per-adapter one, and shared
+// by every provider) was also missing project cwd context. resolveRoutableSession
+// now resolves it from the session's persisted binding; this proves it
+// actually reaches the snapshot call, for a thread's very first turn, not
+// just adapter-level injection.
+let capturedCwdArgs: Array<string | undefined> = [];
+const kistackCwdFixture = makeProviderServiceLayer({
+  refreshKiStackSkills: async () => {},
+  getKiStackInstructionsSnapshot: (cwd?: string) => {
+    capturedCwdArgs.push(cwd);
+    return { revision: bundle.revision, instructions: "<kistack-cwd-aware>" };
+  },
+});
+kistackCwdFixture.layer("KiStack instructions receive project cwd", (it) => {
+  it.effect("passes the session's persisted cwd into getKiStackInstructionsSnapshot", () =>
+    Effect.gen(function* () {
+      capturedCwdArgs = [];
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("kistack-cwd-propagation");
+      const cwd = fixtureCwd("kistack-cwd-project");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd,
+        runtimeMode: "full-access",
+      });
+
+      yield* provider.sendTurn({ threadId, input: "hello" });
+
+      assert.ok(capturedCwdArgs.length > 0);
+      assert.equal(capturedCwdArgs.at(-1), cwd);
     }),
   );
 });

@@ -113,8 +113,12 @@ export interface ProviderServiceLiveOptions {
   readonly revokeMcpCredential?: typeof McpSessionRegistry.revokeActiveMcpThread;
   /** Test seam for the best-effort refresh run after an agent request. */
   readonly refreshKiStackSkills?: () => Promise<unknown>;
-  /** Test seam for the current KiStack revision and instruction catalog. */
-  readonly getKiStackInstructionsSnapshot?: () => {
+  /**
+   * Test seam for the current KiStack revision and instruction catalog.
+   * `cwd`, when known, lets a project-local `.claude/skills/<name>` override
+   * a same-named bundled KiStack skill in the generated instructions.
+   */
+  readonly getKiStackInstructionsSnapshot?: (cwd?: string) => {
     readonly revision: string;
     readonly instructions: string;
   };
@@ -352,9 +356,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const refreshKiStackSkills = options?.refreshKiStackSkills ?? refreshKiStackSkillsDefault;
   const getKiStackInstructionsSnapshot =
     options?.getKiStackInstructionsSnapshot ??
-    (() => ({
+    ((cwd?: string) => ({
       revision: getKiStackRevision(),
-      instructions: buildKiStackInstructions(),
+      instructions: buildKiStackInstructions(undefined, cwd),
     }));
   const kiStackRevisionByThread = new Map<ThreadId, string>();
   const fileSystem = yield* FileSystem.FileSystem;
@@ -1122,6 +1126,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     }
     const instanceId = yield* requireBindingInstanceId(input.operation, binding);
     const adapter = yield* registry.getByInstance(instanceId);
+    // Same persisted-cwd lookup startSession uses -- sendTurn has no cwd
+    // field of its own (a turn only carries threadId/input/attachments/etc),
+    // so this is the only place downstream code (KiStack skill precedence,
+    // the writer lease) can learn the project path for an in-progress thread.
+    const cwd = readPersistedCwd(binding.runtimePayload);
 
     const hasRequestedSession = yield* adapter.hasSession(input.threadId);
     if (hasRequestedSession) {
@@ -1130,6 +1139,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         instanceId,
         threadId: input.threadId,
         runtimeMode: binding.runtimeMode,
+        cwd,
         isActive: true,
       } as const;
     }
@@ -1140,6 +1150,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         instanceId,
         threadId: input.threadId,
         runtimeMode: binding.runtimeMode,
+        cwd,
         isActive: false,
       } as const;
     }
@@ -1153,6 +1164,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       instanceId,
       threadId: input.threadId,
       runtimeMode: recovered.session.runtimeMode,
+      cwd,
       isActive: true,
     } as const;
   });
@@ -1451,7 +1463,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       }
       metricProvider = routed.adapter.provider;
       metricModel = input.modelSelection?.model;
-      const kiStackSnapshot = getKiStackInstructionsSnapshot();
+      const kiStackSnapshot = getKiStackInstructionsSnapshot(routed.cwd);
       // The per-thread map records what this service has actually delivered
       // to the provider session. Falling back to the bundled revision makes a
       // newly started or resumed session look initialized when the live
