@@ -711,6 +711,122 @@ kistackCwdFixture.layer("KiStack instructions receive project cwd", (it) => {
   );
 });
 
+// Writer-lease enforcement integration tests (kicad-agent-phase2 P0-2).
+// The primitive itself (acquire/release/heartbeat/stale-recovery) is
+// already covered exhaustively in ProjectWriterLease.test.ts; these prove
+// sendTurn actually gates on it for real, provider-agnostic by construction
+// since every provider flows through this one function.
+const writerLeaseFixture = makeProviderServiceLayer({
+  refreshKiStackSkills: async () => {},
+});
+writerLeaseFixture.layer("Writer lease enforcement", (it) => {
+  it.effect(
+    "Test A/C: a second write-capable thread on the same project is denied while the first is active, then can acquire once the first completes",
+    () =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const cwd = fixtureCwd("writer-lease-project");
+        const threadA = asThreadId("writer-lease-thread-a");
+        const threadB = asThreadId("writer-lease-thread-b");
+        yield* provider.startSession(threadA, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId: threadA,
+          cwd,
+          runtimeMode: "full-access",
+        });
+        yield* provider.startSession(threadB, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId: threadB,
+          cwd,
+          runtimeMode: "full-access",
+        });
+
+        const aStarted = yield* Deferred.make<void>();
+        const releaseA = yield* Deferred.make<void>();
+        writerLeaseFixture.codex.sendTurn.mockImplementationOnce(() =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(aStarted, undefined);
+            yield* Deferred.await(releaseA);
+            return { threadId: threadA, turnId: asTurnId("writer-lease-turn-a") };
+          }),
+        );
+
+        const forkedA = yield* provider
+          .sendTurn({ threadId: threadA, input: "a" })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(aStarted);
+
+        // Test A: B is denied BEFORE its own adapter sendTurn ever runs.
+        const callsBeforeB = writerLeaseFixture.codex.sendTurn.mock.calls.length;
+        const denial = yield* Effect.flip(provider.sendTurn({ threadId: threadB, input: "b" }));
+        assert.instanceOf(denial, ProviderValidationError);
+        assert.include(denial.issue, threadA);
+        assert.include(denial.issue, cwd);
+        assert.equal(
+          writerLeaseFixture.codex.sendTurn.mock.calls.length,
+          callsBeforeB,
+          "B's adapter sendTurn must never be called once denied",
+        );
+
+        // Test C: once A completes and releases, B can acquire normally.
+        yield* Deferred.succeed(releaseA, undefined);
+        yield* Fiber.join(forkedA);
+        writerLeaseFixture.codex.sendTurn.mockImplementationOnce(() =>
+          Effect.succeed({ threadId: threadB, turnId: asTurnId("writer-lease-turn-b") }),
+        );
+        const bTurn = yield* provider.sendTurn({ threadId: threadB, input: "b again" });
+        assert.equal(bTurn.threadId, threadB);
+      }),
+  );
+
+  it.effect("Test F: two threads on different projects never contend for the same lease", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadA = asThreadId("writer-lease-isolation-a");
+      const threadB = asThreadId("writer-lease-isolation-b");
+      yield* provider.startSession(threadA, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId: threadA,
+        cwd: fixtureCwd("writer-lease-project-a"),
+        runtimeMode: "full-access",
+      });
+      yield* provider.startSession(threadB, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId: threadB,
+        cwd: fixtureCwd("writer-lease-project-b"),
+        runtimeMode: "full-access",
+      });
+
+      const aStarted = yield* Deferred.make<void>();
+      const releaseA = yield* Deferred.make<void>();
+      writerLeaseFixture.codex.sendTurn.mockImplementationOnce(() =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(aStarted, undefined);
+          yield* Deferred.await(releaseA);
+          return { threadId: threadA, turnId: asTurnId("writer-lease-isolation-turn-a") };
+        }),
+      );
+      const forkedA = yield* provider
+        .sendTurn({ threadId: threadA, input: "a" })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(aStarted);
+
+      writerLeaseFixture.codex.sendTurn.mockImplementationOnce(() =>
+        Effect.succeed({ threadId: threadB, turnId: asTurnId("writer-lease-isolation-turn-b") }),
+      );
+      const bTurn = yield* provider.sendTurn({ threadId: threadB, input: "b" });
+      assert.equal(bTurn.threadId, threadB);
+
+      yield* Deferred.succeed(releaseA, undefined);
+      yield* Fiber.join(forkedA);
+    }),
+  );
+});
+
 it.effect("ProviderServiceLive catches stopAll failures during shutdown", () =>
   Effect.gen(function* () {
     const codex = makeFakeCodexAdapter();

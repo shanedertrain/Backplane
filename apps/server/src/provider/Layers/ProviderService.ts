@@ -49,6 +49,10 @@ import * as Stream from "effect/Stream";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import * as ServerConfig from "../../config.ts";
 import {
+  acquireProjectWriterLease,
+  releaseProjectWriterLease,
+} from "../../kicad/ProjectWriterLease.ts";
+import {
   increment,
   providerMetricAttributes,
   providerRuntimeEventsTotal,
@@ -84,6 +88,16 @@ const isModelSelection = Schema.is(ModelSelection);
 
 /** How long a manual context compaction may run before ProviderService gives up on it. */
 const COMPACTION_COMPLETION_TIMEOUT = "10 minutes";
+
+/**
+ * How long a turn-level writer lease survives without being released before
+ * another thread's acquire may reclaim it as stale. Deliberately generous
+ * (a single turn, unlike a heartbeat-monitored long session, is not
+ * re-acquired mid-flight) -- long enough that no realistic turn duration
+ * looks stale while it's still genuinely running, short enough that a
+ * crashed session's stale lease isn't a permanent lockout.
+ */
+const TURN_WRITER_LEASE_STALE_AFTER_MS = 30 * 60_000;
 
 interface PendingCompaction {
   readonly completion: Deferred.Deferred<string>;
@@ -1463,6 +1477,45 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       }
       metricProvider = routed.adapter.provider;
       metricModel = input.modelSelection?.model;
+
+      // Writer-lease enforcement (kicad-agent-phase2 P0-2). Conservative by
+      // design, per the completion brief's own policy: no provider mode
+      // Backplane can select is a *provably* enforced read-only mode (Claude
+      // Code's "approval-required" still lets a human approve a write
+      // mid-turn), so every write-capable turn is gated here rather than
+      // trying to classify providers/modes individually. Gated on the
+      // *turn's execution*, not just KiCad IPC calls specifically, because a
+      // turn can mutate the project through shell commands and direct file
+      // edits just as easily as through IPC. Read-only Backplane viewer/UI
+      // access never calls sendTurn, so it's unaffected and never blocked.
+      // Skipped entirely when the session has no known project path (cwd) --
+      // there's no project to protect if the agent isn't scoped to one.
+      let acquiredWriterLease = false;
+      if (routed.cwd !== undefined) {
+        const lease = acquireProjectWriterLease({
+          projectPath: routed.cwd,
+          sessionId: input.threadId,
+          provider: String(routed.adapter.provider),
+          staleAfterMs: TURN_WRITER_LEASE_STALE_AFTER_MS,
+        });
+        if (!lease.granted) {
+          return yield* toValidationError(
+            "ProviderService.sendTurn",
+            `Cannot start this turn: thread '${lease.owner.sessionId}' (${lease.owner.provider}) ` +
+              `already holds the writer lease for '${routed.cwd}'. Only one write-capable agent ` +
+              `turn may run against a project at a time.`,
+          );
+        }
+        acquiredWriterLease = true;
+      }
+      const releaseWriterLeaseIfHeld = acquiredWriterLease
+        ? Effect.sync(() => {
+            // routed.cwd is guaranteed defined here: acquiredWriterLease is
+            // only ever set true inside the `routed.cwd !== undefined` branch.
+            releaseProjectWriterLease({ projectPath: routed.cwd!, sessionId: input.threadId });
+          })
+        : Effect.void;
+
       const kiStackSnapshot = getKiStackInstructionsSnapshot(routed.cwd);
       // The per-thread map records what this service has actually delivered
       // to the provider session. Falling back to the bundled revision makes a
@@ -1526,7 +1579,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             threadId: input.threadId,
             requestId: turnMetadata.requestId,
           }),
-      );
+      ).pipe(Effect.ensuring(releaseWriterLeaseIfHeld));
       yield* directory.upsert({
         threadId: input.threadId,
         provider: routed.adapter.provider,
