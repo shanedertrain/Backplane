@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -98,6 +99,7 @@ it("Test C: after a normal release, another session can acquire", async () => {
 // policy -- distinct from stealing an *active* lease, which never happens.
 it("Test D: a stale lease from an abnormally-terminated session can be recovered", async () => {
   await withProjectAndCache((project, cacheRoot) => {
+    // @effect-diagnostics-next-line globalDate:off - fixed test-time baseline, not a real clock read
     const staleTime = Date.now() - 10 * 60_000; // 10 minutes ago
     acquireProjectWriterLease({
       projectPath: project,
@@ -137,6 +139,7 @@ it("Test D: a stale lease from an abnormally-terminated session can be recovered
 
 it("heartbeat keeps an active session's lease from going stale, and only the owner can heartbeat it", async () => {
   await withProjectAndCache((project, cacheRoot) => {
+    // @effect-diagnostics-next-line globalDate:off - fixed test-time baseline, not a real clock read
     const start = Date.now() - 100_000;
     acquireProjectWriterLease({
       projectPath: project,

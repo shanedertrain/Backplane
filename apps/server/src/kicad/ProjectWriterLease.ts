@@ -1,6 +1,15 @@
+// @effect-diagnostics nodeBuiltinImport:off
 /**
  * ProjectWriterLease — prevents two Backplane agent sessions from holding
  * mutation authority over the same KiCad project at the same time.
+ *
+ * Plain node:fs/node:path, matching KiStackSkills.ts's precedent for the
+ * same reason: this is simple, synchronous, low-frequency file I/O (a
+ * lease acquired/heartbeat/released a handful of times per turn, not a hot
+ * path), not worth threading Effect's FileSystem/Path through six
+ * otherwise-plain provider adapters for. `currentTimeMs()` below is the one
+ * `Date.now()` call site, narrowly suppressed rather than file-wide, same
+ * as every caller's `now` override defaults to it.
  *
  * Why this exists: a live concurrent-write hazard was observed between two
  * independent agent sessions operating on the same project checkout at the
@@ -47,6 +56,13 @@ export interface AcquireResult {
 }
 
 const DEFAULT_STALE_AFTER_MS = 60_000;
+
+// The one wall-clock read in this module; every caller's `now` param
+// defaults here so tests can override it deterministically.
+function currentTimeMs(): number {
+  // @effect-diagnostics-next-line globalDate:off
+  return Date.now();
+}
 
 export function projectWriterLeaseDirectory(cacheRoot?: string): string {
   return NodePath.join(
@@ -108,7 +124,7 @@ export function acquireProjectWriterLease(input: {
   readonly now?: number;
   readonly staleAfterMs?: number;
 }): AcquireResult {
-  const now = input.now ?? Date.now();
+  const now = input.now ?? currentTimeMs();
   const staleAfterMs = input.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
   const filePath = leaseFilePath(input.projectPath, input.cacheRoot);
   const existing = readLease(filePath);
@@ -139,7 +155,7 @@ export function heartbeatProjectWriterLease(input: {
   const filePath = leaseFilePath(input.projectPath, input.cacheRoot);
   const existing = readLease(filePath);
   if (!existing || existing.sessionId !== input.sessionId) return false;
-  writeLeaseAtomically(filePath, { ...existing, lastHeartbeat: input.now ?? Date.now() });
+  writeLeaseAtomically(filePath, { ...existing, lastHeartbeat: input.now ?? currentTimeMs() });
   return true;
 }
 
@@ -166,7 +182,7 @@ export function getProjectWriterLeaseOwner(input: {
   const filePath = leaseFilePath(input.projectPath, input.cacheRoot);
   const existing = readLease(filePath);
   if (!existing) return { owner: undefined, stale: false };
-  const now = input.now ?? Date.now();
+  const now = input.now ?? currentTimeMs();
   const staleAfterMs = input.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
   return { owner: existing, stale: isStale(existing, now, staleAfterMs) };
 }
